@@ -6,10 +6,16 @@ from torch_geometric.datasets import Planetoid, Coauthor, Amazon
 from ogb.linkproppred import PygLinkPropPredDataset
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import to_undirected
+from torch_geometric.data import Batch
 import matplotlib.pyplot as plt
 import numpy as np
 import os
 from src.corasen import spectral_graph_coarsening, link_wise_explanation
+
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 # Define a simple GCN (Random weights are sufficient for runtime benchmarking)
 class SimpleGCN(torch.nn.Module):
@@ -72,10 +78,11 @@ def get_dataset(name, root='/tmp/BenchmarkDatasets'):
 def run_benchmark():
     # Ordered roughly by size/complexity
     dataset_names = [
-        'Cora', 'CiteSeer', 'PubMed',
-        'Amazon-Photo', 'Amazon-Computers',
-        'Coauthor-CS', 'Coauthor-Physics',
-        'ogbl-ddi', 'ogbl-collab', 'ogbl-ppa'
+        # 'Cora', 'CiteSeer', 'PubMed',
+        # 'Amazon-Photo', 'Amazon-Computers',
+        # 'Coauthor-CS', 'Coauthor-Physics',
+        # 'ogbl-ddi', 'ogbl-collab',
+        'ogbl-ppa'
     ]
     
     results = []
@@ -83,7 +90,8 @@ def run_benchmark():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    for name in dataset_names:
+    dataset_iter = tqdm(dataset_names, desc="Datasets") if tqdm else dataset_names
+    for name in dataset_iter:
         print(f"\nProcessing {name}...")
         try:
             data, dataset_obj = get_dataset(name)
@@ -148,21 +156,29 @@ def run_benchmark():
         
         # 2. Measure Per-Subgraph Time
         num_samples = 20 # Reduced samples for speed on large sets
+        batch_size = 4
         indices = torch.randint(0, data.edge_index.size(1), (num_samples,))
         sampled_edges = data.edge_index[:, indices].t()
         
         times = []
         try:
             with torch.no_grad():
-                for i in range(num_samples):
-                    u, v = sampled_edges[i].tolist()
+                sub_iter = range(0, num_samples, batch_size)
+                sub_iter = tqdm(sub_iter, desc=f"{name} subgraphs", leave=False) if tqdm else sub_iter
+                for i in sub_iter:
+                    batch_edges = sampled_edges[i:i + batch_size]
                     start = time.time()
-                    
-                    subgraph_data = link_wise_explanation(data, cluster_assignment, (u, v))
-                    _ = model(subgraph_data.x, subgraph_data.edge_index, subgraph_data.edge_attr)
-                    
+
+                    subgraphs = []
+                    for u, v in batch_edges.tolist():
+                        subgraphs.append(link_wise_explanation(data, cluster_assignment, (u, v), agg='mean'))
+
+                    batch = Batch.from_data_list(subgraphs)
+                    _ = model(batch.x, batch.edge_index, batch.edge_attr)
+
                     end = time.time()
-                    times.append(end - start)
+                    per_item = (end - start + t_global) / len(subgraphs)
+                    times.extend([per_item] * len(subgraphs))
         except Exception as e:
              print(f"  Inference Failed: {e}")
              continue
@@ -173,6 +189,7 @@ def run_benchmark():
         
         results.append({
             'dataset': name,
+            'nodes': data.num_nodes,
             'edges': num_edges,
             'time': avg_time,
             'std': std_time
@@ -183,27 +200,24 @@ def run_benchmark():
     # Sort by connections
     results.sort(key=lambda x: x['edges'])
     
-    edges = [r['edges'] for r in results]
-    runtimes = [r['time'] for r in results]
+    edges = np.array([r['edges'] for r in results])
+    nodes = np.array([r['nodes'] for r in results])
+    runtimes = np.array([r['time'] for r in results])
     names = [r['dataset'] for r in results]
-    
-    plt.figure(figsize=(10, 8))
-    plt.loglog(edges, runtimes, 'o-', label='Ours (Coarsening)')
-    
-    for i, txt in enumerate(names):
-        # Alternate label positions to avoid overlap
-        xytext = (0, 10) if i % 2 == 0 else (0, -15)
-        plt.annotate(txt, (edges[i], runtimes[i]), textcoords="offset points", xytext=xytext, ha='center', fontsize=8)
 
-    plt.xlabel('Number of Edges |E|')
-    plt.ylabel('Time per Subgraph (s)')
-    plt.title('Runtime Scaling vs Edge Count')
-    plt.grid(True, which="both", ls="-", alpha=0.5)
-    plt.legend()
+    def scale_sizes(values, min_size=60, max_size=420):
+        if values.max() == values.min():
+            return np.full_like(values, (min_size + max_size) / 2, dtype=float)
+        return np.interp(np.log10(values), (np.log10(values).min(), np.log10(values).max()), (min_size, max_size))
     
-    os.makedirs('plots', exist_ok=True)
-    plt.savefig('plots/runtime_scaling_extended.pdf')
-    print("Saved plot to plots/runtime_scaling_extended.pdf")
+    # Save raw data for future plotting
+    import json
+    with open('plots/benchmark_results.json', 'a') as f:
+        json.dump(results, f, indent=4)
+        print("Saved results to plots/benchmark_results.json")
+
+    plt.savefig('plots/runtime_scaling_edges_nodes.pdf')
+    print("Saved plot to plots/runtime_scaling_edges_nodes.pdf")
 
 if __name__ == "__main__":
     run_benchmark()

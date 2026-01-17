@@ -1,49 +1,49 @@
+    node_sizes = scale_sizes(nodes)
+    edge_sizes = scale_sizes(edges)
 
-import matplotlib.pyplot as plt
-import os
+    fig, axes = plt.subplots(1, 2, figsize=(13, 6), constrained_layout=True)
 
-# Data collected from benchmark logs
-results = [
-    {'dataset': 'Cora', 'edges': 10556, 'time': 0.060265},
-    {'dataset': 'CiteSeer', 'edges': 9104, 'time': 0.070394},
-    {'dataset': 'PubMed', 'edges': 88648, 'time': 0.567532},
-    {'dataset': 'Amazon-Photo', 'edges': 238162, 'time': 0.179596},
-    {'dataset': 'Amazon-Computers', 'edges': 491722, 'time': 0.354250},
-    {'dataset': 'Coauthor-CS', 'edges': 163788, 'time': 0.535559},
-    {'dataset': 'Coauthor-Physics', 'edges': 495924, 'time': 1.441850},
-    {'dataset': 'ogbl-ddi', 'edges': 2135822, 'time': 0.090220},
-    {'dataset': 'ogbl-collab', 'edges': 2358104, 'time': 12.114132},
-]
+    scatter_edges = axes[0].scatter(
+        edges,
+        runtimes,
+        s=node_sizes,
+        c=np.log10(nodes),
+        cmap='viridis',
+        alpha=0.85,
+        edgecolors='k',
+        linewidths=0.4,
+        label='Datasets'
+    )
+    axes[0].set_xscale('log')
+    axes[0].set_yscale('log')
+    axes[0].set_xlabel('Number of Edges |E|')
+    axes[0].set_ylabel('Time per Subgraph (s)')
+    axes[0].set_title('Runtime vs Edges (Node Count Encoded)')
+    axes[0].grid(True, which="both", ls="-", alpha=0.4)
+    fig.colorbar(scatter_edges, ax=axes[0], label='log10(|V|)')
 
-# Sort
-results.sort(key=lambda x: x['edges'])
+    scatter_nodes = axes[1].scatter(
+        nodes,
+        runtimes,
+        s=edge_sizes,
+        c=np.log10(edges),
+        cmap='plasma',
+        alpha=0.85,
+        edgecolors='k',
+        linewidths=0.4,
+        label='Datasets'
+    )
+    axes[1].set_xscale('log')
+    axes[1].set_yscale('log')
+    axes[1].set_xlabel('Number of Nodes |V|')
+    axes[1].set_ylabel('Time per Subgraph (s)')
+    axes[1].set_title('Runtime vs Nodes (Edge Count Encoded)')
+    axes[1].grid(True, which="both", ls="-", alpha=0.4)
+    fig.colorbar(scatter_nodes, ax=axes[1], label='log10(|E|)')
 
-edges = [r['edges'] for r in results]
-runtimes = [r['time'] for r in results]
-names = [r['dataset'] for r in results]
-
-plt.figure(figsize=(10, 8))
-plt.loglog(edges, runtimes, 'o-', label='Ours (Coarsening)')
-
-
-texts = []
-for i, txt in enumerate(names):
-    # plt.annotate(txt, (edges[i], runtimes[i]), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8)
-    texts.append(plt.text(edges[i], runtimes[i], txt, fontsize=9))
-
-# Try auto-adjust if library exists, else just annotate
-try:
-    from adjustText import adjust_text
-    adjust_text(texts, arrowprops=dict(arrowstyle='-', color='gray', lw=0.5))
-except ImportError:
-    pass
-
-plt.xlabel('Number of Edges |E|')
-plt.ylabel('Time per Subgraph (s)')
-plt.title('Runtime Scaling vs Edge Count')
-plt.grid(True, which="both", ls="-", alpha=0.5)
-plt.legend()
-
-os.makedirs('plots', exist_ok=True)
-plt.savefig('plots/runtime_scaling_extended.pdf')
-print("Saved plot to plots/runtime_scaling_extended.pdf")
+    for i, txt in enumerate(names):
+        xytext = (0, 10) if i % 2 == 0 else (0, -15)
+        axes[0].annotate(txt, (edges[i], runtimes[i]), textcoords="offset points", xytext=xytext, ha='center', fontsize=8)
+        axes[1].annotate(txt, (nodes[i], runtimes[i]), textcoords="offset points", xytext=xytext, ha='center', fontsize=8)
+    
+    os.makedirs('plots', exist_ok=True)

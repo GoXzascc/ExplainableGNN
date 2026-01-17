@@ -64,6 +64,93 @@ def compute_top_k_eigen_sparse(edge_index, num_nodes, k):
     
     return torch.from_numpy(vals.copy()).float(), torch.from_numpy(vecs.copy()).float()
 
+def compute_top_k_eigen_dense_torch(edge_index, num_nodes, k, device):
+    """
+    Computes top-k eigen decomposition using dense torch ops (GPU-friendly).
+    """
+    # Build dense adjacency on target device
+    adj = to_dense_adj(edge_index, max_num_nodes=num_nodes).squeeze(0).to(device)
+
+    # Add self-loops
+    adj = adj + torch.eye(num_nodes, device=device)
+
+    # Normalized adjacency: D^{-1/2} (A + I) D^{-1/2}
+    deg = adj.sum(dim=1)
+    deg_inv_sqrt = deg.pow(-0.5)
+    deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0
+    norm_adj = deg_inv_sqrt.view(-1, 1) * adj * deg_inv_sqrt.view(1, -1)
+
+    # Full eigen decomposition, then take top-k
+    vals, vecs = torch.linalg.eigh(norm_adj)
+    if k >= num_nodes:
+        return vals.float(), vecs.float()
+
+    topk_vals, topk_idx = torch.topk(vals, k, largest=True)
+    topk_vecs = vecs[:, topk_idx]
+    return topk_vals.float(), topk_vecs.float()
+
+def compute_top_k_eigen_lobpcg(edge_index, num_nodes, k, device, max_iter=100, tol=1e-4):
+    """
+    Computes top-k eigen decomposition using LOBPCG on a sparse normalized adjacency (GPU-friendly).
+    """
+    # Build sparse normalized adjacency on device
+    edge_index, _ = remove_self_loops(edge_index)
+    self_loops = torch.arange(num_nodes, device=device)
+    self_loops = torch.stack([self_loops, self_loops], dim=0)
+    full_edge_index = torch.cat([edge_index.to(device), self_loops], dim=1)
+
+    row, col = full_edge_index
+    values = torch.ones(full_edge_index.size(1), device=device)
+
+    deg = torch.zeros(num_nodes, device=device)
+    deg.index_add_(0, row, values)
+    deg_inv_sqrt = deg.pow(-0.5)
+    deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0
+
+    norm_values = values * deg_inv_sqrt[row] * deg_inv_sqrt[col]
+    norm_adj = torch.sparse_coo_tensor(full_edge_index, norm_values, (num_nodes, num_nodes), device=device)
+
+    # Free memory of intermediate tensors
+    del row, col, values, deg, deg_inv_sqrt, norm_values, full_edge_index, self_loops
+    torch.cuda.empty_cache()
+
+    # LOBPCG expects a symmetric matrix; normalized adjacency is symmetric for undirected graphs.
+    # Use a random initial guess.
+    init = torch.randn(num_nodes, k, device=device)
+    try:
+        vals, vecs = torch.lobpcg(norm_adj, k=k, largest=True, niter=max_iter, tol=tol, X=init)
+    except RuntimeError as e:
+        if 'out of memory' in str(e).lower():
+            print(f"  LOBPCG OOM on GPU. Converting to CPU for eigen decomp of {num_nodes} nodes...")
+            torch.cuda.empty_cache()
+            # Move to CPU
+            norm_adj_cpu = norm_adj.cpu()
+            # If norm_adj was coalesced, fine. If not, coalesce.
+            if not norm_adj_cpu.is_coalesced():
+                norm_adj_cpu = norm_adj_cpu.coalesce()
+            
+            # Scipy eigsh on CPU is usually more robust for memory
+            # Convert to scipy
+            import scipy.sparse as sp
+            row = norm_adj_cpu.indices()[0].numpy()
+            col = norm_adj_cpu.indices()[1].numpy()
+            data = norm_adj_cpu.values().numpy()
+            scipy_adj = sp.coo_matrix((data, (row, col)), shape=(num_nodes, num_nodes))
+            
+            vals_np, vecs_np = sp.linalg.eigsh(scipy_adj, k=k, which='LA')
+            
+            # Sort descending
+            idx = np.argsort(vals_np)[::-1]
+            vals_np = vals_np[idx]
+            vecs_np = vecs_np[:, idx]
+            
+            vals = torch.from_numpy(vals_np.copy()).float().to(device)
+            vecs = torch.from_numpy(vecs_np.copy()).float().to(device)
+        else:
+            raise e
+            
+    return vals.float(), vecs.float()
+
 def compute_perturbation_scores(eigenvalues, eigenvectors, edge_index, k):
     """
     Computes the perturbation score \Delta_{(a,b)}.
@@ -117,12 +204,35 @@ def compute_perturbation_scores(eigenvalues, eigenvectors, edge_index, k):
     
     return scores
 
-def partition_nodes(edge_index, scores, num_nodes, alpha):
+def partition_nodes(edge_index, scores, num_nodes, alpha, approx_gpu=True, edge_factor=2, max_lp_iters=10):
     """
     Implements Algorithm 2: Node Partition Rule.
     Uses Union-Find to efficiently merge nodes based on lowest perturbation scores.
     Merged sets (clusters) are formed until alpha * N merges are performed.
     """
+    if edge_index.is_cuda and approx_gpu and hasattr(torch.Tensor, "scatter_reduce_"):
+        num_edges = edge_index.size(1)
+        target_edges = min(num_edges, int(alpha * num_nodes * edge_factor))
+        if target_edges <= 0:
+            cluster_assignment = torch.arange(num_nodes, device=edge_index.device, dtype=torch.long)
+            return cluster_assignment, num_nodes
+
+        _, top_idx = torch.topk(scores, k=target_edges, largest=False)
+        sub_edges = edge_index[:, top_idx]
+        row, col = sub_edges
+
+        labels = torch.arange(num_nodes, device=edge_index.device, dtype=torch.long)
+        for _ in range(max_lp_iters):
+            new_labels = labels.clone()
+            new_labels.scatter_reduce_(0, row, labels[col], reduce='amin', include_self=True)
+            new_labels.scatter_reduce_(0, col, labels[row], reduce='amin', include_self=True)
+            if torch.equal(new_labels, labels):
+                break
+            labels = new_labels
+
+        unique_labels, inverse = torch.unique(labels, return_inverse=True)
+        return inverse, unique_labels.numel()
+
     # Sort edges by score
     sorted_idx = torch.argsort(scores)
     sorted_edges = edge_index[:, sorted_idx]
@@ -294,29 +404,61 @@ def dense_to_sparse_with_attr(adj): # Unused now
     return edge_index, values
 
 
-def spectral_graph_coarsening(data, k=10, alpha=0.5):
+def spectral_graph_coarsening(
+    data,
+    k=10,
+    alpha=0.5,
+    dense_threshold=5000,
+    eigen_method="auto",
+    lobpcg_max_nodes=2000000
+):
     """
     Main pipeline for global coarsening.
     """
     num_nodes = data.num_nodes
     
-    # 1. Compute Top-k Eigen using Sparse Solver
-    # Pass edge_index directly
-    vals, vecs = compute_top_k_eigen_sparse(data.edge_index, num_nodes, k)
+    # 1. Compute Top-k Eigen
+    # Use GPU dense path for smaller graphs; CPU sparse for large graphs.
+    use_dense_gpu = data.x.is_cuda and num_nodes <= dense_threshold
+    use_lobpcg = data.x.is_cuda and num_nodes <= lobpcg_max_nodes
+
+    if eigen_method == "dense" and use_dense_gpu:
+        vals, vecs = compute_top_k_eigen_dense_torch(data.edge_index, num_nodes, k, data.x.device)
+        edge_index_for_scores = data.edge_index
+    elif eigen_method == "lobpcg" and use_lobpcg:
+        vals, vecs = compute_top_k_eigen_lobpcg(data.edge_index, num_nodes, k, data.x.device)
+        edge_index_for_scores = data.edge_index
+    elif eigen_method == "auto":
+        if use_dense_gpu:
+            vals, vecs = compute_top_k_eigen_dense_torch(data.edge_index, num_nodes, k, data.x.device)
+            edge_index_for_scores = data.edge_index
+        elif use_lobpcg:
+            vals, vecs = compute_top_k_eigen_lobpcg(data.edge_index, num_nodes, k, data.x.device)
+            edge_index_for_scores = data.edge_index
+        else:
+            edge_index_cpu = data.edge_index.cpu()
+            vals, vecs = compute_top_k_eigen_sparse(edge_index_cpu, num_nodes, k)
+            edge_index_for_scores = edge_index_cpu
+    else:
+        edge_index_cpu = data.edge_index.cpu()
+        vals, vecs = compute_top_k_eigen_sparse(edge_index_cpu, num_nodes, k)
+        edge_index_for_scores = edge_index_cpu
     
     # 2. Compute Scores
-    edge_index_no_loop, _ = remove_self_loops(data.edge_index) # Clean loops for scoring
+    edge_index_no_loop, _ = remove_self_loops(edge_index_for_scores) # Clean loops for scoring
     scores = compute_perturbation_scores(vals, vecs, edge_index_no_loop, k)
     
     # 3. Partition
     cluster_assignment, num_clusters = partition_nodes(edge_index_no_loop, scores, num_nodes, alpha)
+    if data.x.is_cuda:
+        cluster_assignment = cluster_assignment.to(data.x.device)
     
     # 4. Build Coarse Graph
     coarse_data, P = build_coarse_graph(data, cluster_assignment, num_clusters)
     
     return coarse_data, cluster_assignment, P
 
-def link_wise_explanation(data, cluster_assignment, target_edge):
+def link_wise_explanation(data, cluster_assignment, target_edge, agg='mean'):
     """
     Generates the link-wise explanatory subgraph G'_{(a,b)}.
     Splits the clusters containing a and b.
@@ -416,27 +558,20 @@ def link_wise_explanation(data, cluster_assignment, target_edge):
     # unused P_hat removed
 
 
-    # Features: LogSumExp for kept clusters, Identity for split nodes
-    # X'_{C_i} = log sum exp (X_u)
-    
+    # Features: mean aggregation (GPU-friendly) or LogSumExp (original, slower)
     X_prime = torch.zeros(total_new_nodes, data.x.size(1), device=data.x.device)
-    
-    # For split nodes (identity)
-    # The split nodes are mapped to indices >= num_kept
-    # The original indices are split_nodes
-    X_prime[num_kept:] = data.x[split_nodes]
-    
-    # For kept clusters
-    # We iterate kept clusters to apply LSE
-    # (Vectorized LSE might be tricky with variable sizes, loop is safer for now)
-    for i, c_id in enumerate(kept_clusters):
-        # finding original nodes in this cluster
-        mask = (cluster_assignment == c_id)
-        nodes_in_c = data.x[mask]
-        # LSE along node dimension (0)
-        # LSE(x) = log(sum(exp(x)))
-        lse = torch.logsumexp(nodes_in_c, dim=0)
-        X_prime[i] = lse
+    if agg == 'lse':
+        X_prime[num_kept:] = data.x[split_nodes]
+        for i, c_id in enumerate(kept_clusters):
+            mask = (cluster_assignment == c_id)
+            nodes_in_c = data.x[mask]
+            lse = torch.logsumexp(nodes_in_c, dim=0)
+            X_prime[i] = lse
+    else:
+        X_prime.index_add_(0, new_assignment, data.x)
+        counts = torch.zeros(total_new_nodes, device=data.x.device)
+        counts.index_add_(0, new_assignment, torch.ones(data.num_nodes, device=data.x.device))
+        X_prime = X_prime / counts.clamp_min(1).unsqueeze(1)
 
     # Weights and Edges
     # W = P_hat^T A P_hat. 
@@ -469,4 +604,3 @@ def link_wise_explanation(data, cluster_assignment, target_edge):
     data_link = Data(x=X_prime, edge_index=edge_index_prime, edge_attr=edge_attr_prime)
     
     return data_link
-
