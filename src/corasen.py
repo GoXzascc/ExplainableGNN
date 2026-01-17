@@ -4,240 +4,288 @@ from torch_geometric.utils import to_dense_adj, get_laplacian, add_self_loops, r
 from torch_geometric.data import Data
 import numpy as np
 
-def get_normalized_adjacency(edge_index, num_nodes):
-    """
-    Computes the symmetrically normalized adjacency matrix \hat{A}.
-    \hat{A} = D^{-1/2} (A + I) D^{-1/2}
-    """
-    edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes)
-    
-    # Compute degree
-    row, col = edge_index
-    deg = torch.zeros(num_nodes, dtype=torch.float, device=edge_index.device)
-    deg.scatter_add_(0, row, torch.ones(edge_index.size(1), device=edge_index.device))
-    
-    deg_inv_sqrt = deg.pow(-0.5)
-    deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+import torch
+import scipy.sparse as sp
+import numpy as np
+from torch_geometric.utils import to_scipy_sparse_matrix, remove_self_loops
+from torch_geometric.data import Data
 
-    # We can use dense matrix for spectral decomposition as it is often faster for 
-    # small/medium graphs which we likely handle here, or we need sparse eig decomp.
-    # For stability and simplicity in this POC, let's use dense.
-    adj = to_dense_adj(edge_index, max_num_nodes=num_nodes)[0]
+def get_normalized_adjacency_sparse(edge_index, num_nodes):
+    """
+    Computes \hat{A} as a scipy sparse matrix.
+    """
+    # Remove loops first to be safe, then add back
+    edge_index, _ = remove_self_loops(edge_index)
     
-    # D^{-1/2} A D^{-1/2}
-    d_mat_inv_sqrt = torch.diag(deg_inv_sqrt)
-    norm_adj = d_mat_inv_sqrt @ adj @ d_mat_inv_sqrt
+    # Construct adjacency
+    adj = to_scipy_sparse_matrix(edge_index, num_nodes=num_nodes)
     
+    # +I
+    adj = adj + sp.eye(num_nodes)
+    
+    # D^{-1/2}
+    deg = np.array(adj.sum(axis=1)).flatten()
+    deg_inv_sqrt = np.power(deg, -0.5)
+    deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+    
+    D_inv_sqrt = sp.diags(deg_inv_sqrt)
+    
+    # D^{-1/2} (A + I) D^{-1/2} = D^{-1/2} adj D^{-1/2}
+    norm_adj = D_inv_sqrt @ adj @ D_inv_sqrt
     return norm_adj
 
-def compute_top_k_eigen(norm_adj, k):
+def compute_top_k_eigen_sparse(edge_index, num_nodes, k):
     """
-    Computes the top-k eigenvectors and eigenvalues of the normalized adjacency matrix.
+    Computes top-k eigen decomposition using scipy sparse solver.
     """
-    # Since norm_adj is symmetric
-    eigenvalues, eigenvectors = torch.linalg.eigh(norm_adj)
+    norm_adj = get_normalized_adjacency_sparse(edge_index, num_nodes)
     
-    # Sort in descending order (eigh returns ascending)
-    idx = torch.argsort(eigenvalues, descending=True)
-    eigenvalues = eigenvalues[idx]
-    eigenvectors = eigenvectors[:, idx]
+    # Use eigsh for symmetric matrices
+    # k+1 because sometimes the largest is just 1 (stationary), we might want variations
+    # But theorem says top-k of \hat{A}.
+    # \hat{A} eigenvalues are in [-1, 1]. Top means largest magnitude or largest positive?
+    # Usually largest positive = low frequency in Laplacian L = I - \hat{A}.
+    # Largest \lambda of \hat{A}  <-> Smallest \lambda of L.
+    # We want "Dominant spectral components". 
+    # Paper Section 2.2: "Top-k spectral components... correspond to most influential ways information spreads".
+    # Usually this means largest algebraic values.
     
-    return eigenvalues[:k], eigenvectors[:, :k]
+    # Check if k >= num_nodes
+    if k >= num_nodes:
+        vals, vecs = np.linalg.eigh(norm_adj.toarray())
+    else:
+        # 'LA' = Largest Algebraic
+        vals, vecs = sp.linalg.eigsh(norm_adj, k=k, which='LA')
+    
+    # Sort descending
+    idx = np.argsort(vals)[::-1]
+    vals = vals[idx]
+    vecs = vecs[:, idx]
+    
+    return torch.from_numpy(vals.copy()).float(), torch.from_numpy(vecs.copy()).float()
 
 def compute_perturbation_scores(eigenvalues, eigenvectors, edge_index, k):
     """
-    Computes the perturbation score \Delta_{(a,b)} for each edge (a,b).
-    Uses the approximation from Theorem 2.
+    Computes the perturbation score \Delta_{(a,b)}.
     """
+    device = edge_index.device
     num_edges = edge_index.size(1)
-    scores = torch.zeros(num_edges, device=edge_index.device)
     
-    # Pre-compute terms to speed up
-    # However, the formula is per-edge.
-    # \Delta_{(a,b)} \approx \sum_{i=1}^k | \nu_i / \eta_i |
+    # Move to device if not
+    vals = eigenvalues.to(device)
+    vecs = eigenvectors.to(device)
     
-    # Loop over edges is inevitable without complex vectorization, 
-    # but for prototype we can loop.
-    # Let's try to vectorize over 'k' for each edge.
+    # To vectorize score computation:
+    # \Delta = \sum_i | \nu_i / \eta_i |
     
     row, col = edge_index
     
-    for e in range(num_edges):
-        u, v = row[e].item(), col[e].item()
-        if u == v:
-            scores[e] = float('inf') # Don't merge self-loops if any
-            continue
-            
-        # Get u and v components of all k eigenvectors: shape (k,)
-        u_vec = eigenvectors[u, :] 
-        v_vec = eigenvectors[v, :] 
-        
-        # \eta_i = v_i^T u_i - (u_{ia}v_{ia} + u_{ib}v_{ib})
-        # Since symmetric, u_i = v_i.
-        # \eta_i = 1 - (u_{ia}^2 + u_{ib}^2)  (Assuming normalized eigenvectors v_i^T v_i = 1)
-        eta = 1.0 - (u_vec**2 + v_vec**2)
-        
-        # \nu_i ... formula in Theorem 2
-        # u_{ia} corresponds to 'a' component of eigenvector i
-        # u_{ib} corresponds to 'b' component
-        # v_{ia} = u_{ia}, v_{ib} = u_{ib}
-        
-        # \nu_i = -u_{ia}^2 + 3 u_{ia} u_{ib} + (3 - \lambda_i) u_{ib} u_{ia} + (\lambda_i - 1) u_{ib}^2
-        #       = -u_{ia}^2 + 3 u_{ia} u_{ib} + 3 u_{ia} u_{ib} - \lambda_i u_{ia} u_{ib} + \lambda_i u_{ib}^2 - u_{ib}^2
-        #       = -u_{ia}^2 - u_{ib}^2 + (6 - \lambda_i) u_{ia} u_{ib} + \lambda_i u_{ib}^2 ?
-        # Wait, let's re-read the theorem carefully. 
-        # \nu_i = -v_{ia}u_{ia} + 3v_{ia}u_{ib} + (3-\lambda_i)v_{ib}u_{ia} + (\lambda_i - 1)v_{ib}u_{ib}
-        # substitutions:
-        # = -u_{ia}^2 + 3 u_{ia} u_{ib} + (3 - \lambda_i) u_{ib} u_{ia} + (\lambda_i - 1) u_{ib}^2
-        # = -u_{ia}^2 + (3 + 3 - \lambda_i) u_{ia} u_{ib} + (\lambda_i - 1) u_{ib}^2
-        # = -u_{ia}^2 + (6 - \lambda_i) u_{ia} u_{ib} + (\lambda_i - 1) u_{ib}^2
-        
-        term1 = -u_vec**2
-        term2 = (6.0 - eigenvalues) * u_vec * v_vec
-        term3 = (eigenvalues - 1.0) * v_vec**2
-        
-        nu = term1 + term2 + term3
-        
-        # Avoid division by zero
-        eta[eta.abs() < 1e-6] = 1e-6
-        
-        ratio = (nu / eta).abs()
-        scores[e] = ratio.sum()
-        
+    # Gather u, v vectors: (num_edges, k)
+    u_vecs = vecs[row] 
+    v_vecs = vecs[col]
+    
+    # eta = 1 - (u^2 + v^2)  (assuming unit norm)
+    # (num_edges, k)
+    eta = 1.0 - (u_vecs.pow(2) + v_vecs.pow(2))
+    
+    # nu terms
+    # term1 = -u^2
+    # term2 = (6 - lambda) * u * v
+    # term3 = (lambda - 1) * v^2
+    
+    # vals: (k,) -> (1, k)
+    vals_expanded = vals.unsqueeze(0)
+    
+    term1 = -u_vecs.pow(2)
+    term2 = (6.0 - vals_expanded) * u_vecs * v_vecs
+    term3 = (vals_expanded - 1.0) * v_vecs.pow(2)
+    
+    nu = term1 + term2 + term3
+    
+    # Prevent div by zero
+    eta_safe = eta.clone()
+    eta_safe[eta_safe.abs() < 1e-6] = 1e-6
+    
+    ratio = (nu / eta_safe).abs()
+    
+    # Sum over k -> (num_edges,)
+    scores = ratio.sum(dim=1)
+    
+    # Handle self-loops (result in weird scores, set to inf)
+    mask = (row == col)
+    scores[mask] = float('inf')
+    
     return scores
 
 def partition_nodes(edge_index, scores, num_nodes, alpha):
     """
     Implements Algorithm 2: Node Partition Rule.
-    Greedily merges nodes with lowest perturbation scores.
+    Uses Union-Find to efficiently merge nodes based on lowest perturbation scores.
+    Merged sets (clusters) are formed until alpha * N merges are performed.
     """
     # Sort edges by score
     sorted_idx = torch.argsort(scores)
     sorted_edges = edge_index[:, sorted_idx]
     
-    # Partition map: node_id -> cluster_id
-    # Initially everyone in their own cluster?
-    # No, Algo says: "Init partition with empty classes... Place both a and b into an empty class Ci"
-    # This implies we are building the partition P.
+    # Move to CPU / Numpy for sequential loop performance
+    # iterating over tensor items one by one is slow in Python.
+    edges_np = sorted_edges.cpu().numpy()
+    row, col = edges_np[0], edges_np[1]
     
-    # Let's track which cluster each node belongs to.
-    # -1 means unassigned.
-    cluster_assignment = torch.full((num_nodes,), -1, dtype=torch.long)
-    next_cluster_id = 0
+    # Union-Find initialization
+    parent = np.arange(num_nodes)
     
+    def find(i):
+        # Iterative path compression
+        path = []
+        root = i
+        while root != parent[root]:
+            path.append(root)
+            root = parent[root]
+        
+        for node in path:
+            parent[node] = root
+        return root
+
     num_merges = 0
-    target_merges = int(alpha * num_nodes) 
-    # Note: alpha |V| merges might be too many if alpha is close to 1 ? 
-    # If we merge pairs, we reduce count.
-    # Algo loop: while m < alpha |V|
+    target_merges = int(alpha * num_nodes)
     
-    row, col = sorted_edges
-    
-    for i in range(sorted_edges.size(1)):
+    # Iterate and merge
+    num_edges = len(row)
+    for i in range(num_edges):
         if num_merges >= target_merges:
             break
             
-        u, v = row[i].item(), col[i].item()
+        u, v = row[i], col[i]
+        root_u = find(u)
+        root_v = find(v)
         
-        # Check current assignments
-        c_u = cluster_assignment[u].item()
-        c_v = cluster_assignment[v].item()
+        if root_u != root_v:
+            parent[root_u] = root_v
+            num_merges += 1
+            
+    # Assign final cluster IDs
+    # Flatten structure
+    final_clusters = np.zeros(num_nodes, dtype=np.int64)
+    for i in range(num_nodes):
+        final_clusters[i] = find(i)
         
-        if c_u == -1 and c_v == -1:
-            # New cluster
-            cluster_assignment[u] = next_cluster_id
-            cluster_assignment[v] = next_cluster_id
-            next_cluster_id += 1
-            num_merges += 1
-        elif c_u != -1 and c_v == -1:
-            # Add v to u's cluster
-            cluster_assignment[v] = c_u
-            num_merges += 1
-        elif c_u == -1 and c_v != -1:
-            # Add u to v's cluster
-            cluster_assignment[u] = c_v
-            num_merges += 1
-        else:
-            # Both assigned. 
-            # If different clusters, do we merge clusters?
-            # Algo says: 
-            # If neither in C -> new class
-            # If only one in C -> add other
-            # If both in C -> Do nothing (implied by missing else)?
-            # Wait, standard coarsening usually merges clusters.
-            # But the algorithm purely says:
-            # "If neither... Place both"
-            # "Else if only one... Place the other"
-            # It DOES NOT handle the case where both are already in different clusters.
-            # This implies we ONLY grow existing clusters or create new ones from unassigned nodes.
-            pass
-            
-    # Handle remaining unassigned nodes
-    # "Send each node to an empty class" -> Assign unique new cluster IDs
-    for n in range(num_nodes):
-        if cluster_assignment[n] == -1:
-            cluster_assignment[n] = next_cluster_id
-            next_cluster_id += 1
-            
-    return cluster_assignment, next_cluster_id
+    # Remap unique roots to contiguous IDs Range(0, num_clusters)
+    # unique returns sorted unique elements
+    unique_roots, inverse = np.unique(final_clusters, return_inverse=True)
+    
+    # To Tensor
+    cluster_assignment = torch.from_numpy(inverse).long()
+    if edge_index.is_cuda:
+        cluster_assignment = cluster_assignment.to(edge_index.device)
+        
+    num_clusters = len(unique_roots)
+    
+    return cluster_assignment, num_clusters
 
 def build_coarse_graph(data, cluster_assignment, num_clusters):
     """
     Constructs the coarse graph G' based on partition.
     P matrix: N x N' (num_nodes x num_clusters)
+    Uses sparse matrix operations to avoid OOM on large graphs.
     """
     device = data.x.device
     num_nodes = data.num_nodes
     
-    # Construct P matrix (sparse)
-    # indices: [node_idx, cluster_idx]
+    # Construct Sparse P matrix (PyTorch Sparse or SciPy)
+    # Using torch.sparse_coo_tensor for GPU compatibility in future,
+    # but for simple algebra, sparse matrix multiplication in torch is 'spspmm'.
+    
     indices = torch.stack([
         torch.arange(num_nodes, device=device),
         cluster_assignment.to(device)
     ])
     values = torch.ones(num_nodes, device=device)
     
-    # P_hat: N x N'
-    P_hat = torch.sparse_coo_tensor(indices, values, (num_nodes, num_clusters)).to_dense()
+    # P_hat (unnormalized) as sparse tensor
+    P_hat = torch.sparse_coo_tensor(indices, values, (num_nodes, num_clusters), device=device)
     
-    # Normalize P to get orthonormal columns
-    # M = diag(m1, ..., mk)
-    cluster_sizes = P_hat.sum(dim=0)
-    # Avoid div by zero (shouldn't happen if every cluster has at least 1 node)
+    # Compute cluster sizes for normalization
+    # P_hat is N x K. 
+    # sum(0) via dense vector
+    cluster_assignment = cluster_assignment.to(device)
+    cluster_sizes = torch.zeros(num_clusters, device=device)
+    cluster_sizes.index_add_(0, cluster_assignment, torch.ones(num_nodes, device=device))
+    
     inv_sqrt_sizes = cluster_sizes.pow(-0.5)
     inv_sqrt_sizes[inv_sqrt_sizes == float('inf')] = 0
     
-    M_inv_sqrt = torch.diag(inv_sqrt_sizes)
-    P = P_hat @ M_inv_sqrt
+    # P = P_hat @ M^{-1/2}
+    # This just scales the columns.
+    # We can scale the values in P_hat directly.
+    # P_vals = 1 * M^{-1/2}[cluster_idx]
+    P_values_norm = inv_sqrt_sizes[cluster_assignment]
+    P = torch.sparse_coo_tensor(indices, P_values_norm, (num_nodes, num_clusters), device=device)
     
     # Coarse Adjacency W = P^T A P
-    adj = to_dense_adj(data.edge_index, max_num_nodes=num_nodes)[0]
-    W = P.t() @ adj @ P
+    # A is sparse. P is sparse. 3 Sparse matmuls?
+    # Torch sparse support is limited. P.t() @ A @ P.
+    # Convert to standard adjacency sparse tensor.
     
+    A_indices = data.edge_index
+    A_values = torch.ones(A_indices.size(1), device=device)
+    A = torch.sparse_coo_tensor(A_indices, A_values, (num_nodes, num_nodes), device=device)
+    
+    # W = P.t() @ (A @ P)
+    # A @ P: (N x N) @ (N x K) -> (N x K)
+    # Note: torch.sparse.mm(A, P) (if P is dense) or sparse @ sparse
+    # Torch sparse @ sparse is `torch.sparse.mm` in recent versions or `sspaddmm`.
+    # Let's try `torch.sparse.mm` assuming 2D.
+    # Actually P is sparse. A is sparse.
+    # PyTorch sparse matmul is strict.
+    # Better to just use indices logic for W construction?
+    # W_uv = sum_{i in Ci, j in Cj} A_ij * P_ik * P_jk
+    # Roughly: transform edge_index (u,v) -> (cluster[u], cluster[v])
+    # Then sum duplicates.
+    
+    row, col = data.edge_index
+    c_row = cluster_assignment[row]
+    c_col = cluster_assignment[col]
+    
+    new_indices = torch.stack([c_row, c_col])
+    
+    # For Unnormalized W (as in Definition 3): \hat{P}^T A \hat{P}
+    # Just sum weights of edges between clusters.
+    # For Normalized W (P^T A P): weighted by 1/sqrt(mi*mj).
+    # Paper Section 2.3 Eq 5 uses \hat{P} (unnormalized).
+    # Then says "We will use normalized P for subsequent steps" (referring to spectral stuff).
+    # But for "Weight and Degree of Coarse Graph", it explicitly uses \hat{P}.
+    # Let's stick to Eq 5 for W: \hat{P}^T A \hat{P} -> Sum of edges.
+    
+    # Coalesce indices
+    # We can use torch_geometric.utils.coalesce
+    from torch_geometric.utils import coalesce
+    edge_index_prime, edge_attr_prime = coalesce(new_indices, torch.ones(new_indices.size(1), device=device), num_nodes=num_clusters, reduce='add')
+        
     # Coarse Features
-    # Typically aggregated. The paper mentions P^T X is one way, 
-    # but for link-wise it mentions LogSumExp.
-    # For global coarse graph, let's follow the standard projection P^T X?
-    # Or aggregation? Definition 3 says "node features X' are aggregated from X".
-    # Usually X' = P^T X corresponds to weighted sum normalized by size (mean pooling roughly).
-    X_prime = P.t() @ data.x
+    # X' = P^T X (weighted mean) or LogSumExp.
+    # Global coarsening usually uses standard projection: X' = P^T X.
+    # X is N x F (Dense). P is sparse.
+    # X' = (P^T @ X) = (X^T @ P)^T
+    # X^T @ P: (F x N) @ (N x K) -> (F x K).
+    # torch.sparse.mm works for (Sparse, Dense). P is Sparse.
+    # P.t() @ X -> Sparse @ Dense -> supported.
     
-    # Create coarse edge_index and edge_weight from W
-    # W is dense N' x N'
-    # extracting edges
-    edge_index_prime, edge_attr_prime = dense_to_sparse_with_attr(W)
+    # Note: If P is sparse (K, N) after transpose.
+    # But transpose of sparse tensor in pytorch might not be coalesced or supported in mm easily.
+    # P is (N, K). P.t() is (K, N).
+    # Let's compute X' = P^T X.
+    # P values are 'P_values_norm' (normalized).
     
-    # Create new Data object
-    # We might need to store W as edge_weight
+    X_prime = torch.sparse.mm(P.t(), data.x) # (K, N) @ (N, F) -> (K, F)
+    
+    # Result
     data_prime = Data(x=X_prime, edge_index=edge_index_prime, edge_attr=edge_attr_prime)
     data_prime.num_nodes = num_clusters
     
     return data_prime, P
 
-def dense_to_sparse_with_attr(adj):
-    """
-    Converts dense adjacency to sparse edge_index and edge_weight.
-    """
+def dense_to_sparse_with_attr(adj): # Unused now
     indices = torch.nonzero(adj)
     rows = indices[:, 0]
     cols = indices[:, 1]
@@ -245,15 +293,16 @@ def dense_to_sparse_with_attr(adj):
     edge_index = torch.stack([rows, cols])
     return edge_index, values
 
+
 def spectral_graph_coarsening(data, k=10, alpha=0.5):
     """
     Main pipeline for global coarsening.
     """
     num_nodes = data.num_nodes
     
-    # 1. Compute Top-k Eigen
-    norm_adj = get_normalized_adjacency(data.edge_index, num_nodes)
-    vals, vecs = compute_top_k_eigen(norm_adj, k)
+    # 1. Compute Top-k Eigen using Sparse Solver
+    # Pass edge_index directly
+    vals, vecs = compute_top_k_eigen_sparse(data.edge_index, num_nodes, k)
     
     # 2. Compute Scores
     edge_index_no_loop, _ = remove_self_loops(data.edge_index) # Clean loops for scoring
@@ -275,6 +324,8 @@ def link_wise_explanation(data, cluster_assignment, target_edge):
     u, v = target_edge
     c_u = cluster_assignment[u].item()
     c_v = cluster_assignment[v].item()
+    
+    device = data.x.device
     
     # Identify nodes in these clusters
     u_nodes = (cluster_assignment == c_u).nonzero(as_tuple=True)[0]
@@ -362,13 +413,8 @@ def link_wise_explanation(data, cluster_assignment, target_edge):
     # Now build P and Coarse Graph
     # This logic is same as build_coarse_graph but with specific feature aggregation
     
-    # Construct P_hat
-    indices = torch.stack([
-        torch.arange(data.num_nodes, device=data.x.device),
-        new_assignment
-    ])
-    values = torch.ones(data.num_nodes, device=data.x.device)
-    P_hat = torch.sparse_coo_tensor(indices, values, (data.num_nodes, total_new_nodes)).to_dense()
+    # unused P_hat removed
+
 
     # Features: LogSumExp for kept clusters, Identity for split nodes
     # X'_{C_i} = log sum exp (X_u)
@@ -393,28 +439,33 @@ def link_wise_explanation(data, cluster_assignment, target_edge):
         X_prime[i] = lse
 
     # Weights and Edges
-    # W = P_hat^T A P_hat (Do we normalize P for link-wise? 
-    # Paper says: W = P^T A P. Usually P is normalized if it's spectral approximation. 
-    # But for interpretation, usually we want summed weights?
-    # Text says: "Edges ... aggregated into weighted super-edges... W = P^T A P... D' = P^T D P"
-    # And Definition 3 uses \hat{P}. Wait.
-    # Theorem 3 says "Given partition matrix \hat{P}... W = \hat{P}^T A \hat{P} ... degree ... D' = \hat{P}^T D \hat{P}".
-    # Then it says "Normalization ... P = \hat{P} M^{-1/2} ... we will use this normalized P for subsequent steps".
-    # BUT Link-wise section says "Similar aggregation rule ... W = P^T A P".
-    # And "Node features ... X' = log sum exp".
-    # It implies we use UN-normalized P (\hat{P}) for W if we want counts, or normalized P if we want spectral.
-    # However, "X' = log sum exp" is explicitly for features.
-    # Let's stick to the definition: W_{(a,b)} = \hat{P}^T A \hat{P}. 
-    # This implies \hat{P} (0/1). 
-    # Let's check text again: "Weighted adjacency ... W = \hat{P}^T A \hat{P}". Yes, hat is used.
+    # W = P_hat^T A P_hat. 
+    # Since we want sparse, we map edges and coalesce.
     
-    # So we use binary P_hat for W calculation.
+    row, col = data.edge_index
+    new_row = new_assignment[row] # Use correct variable
+    new_col = new_assignment[col]
     
-    adj = to_dense_adj(data.edge_index, max_num_nodes=data.num_nodes)[0]
-    W_prime_link = P_hat.t() @ adj @ P_hat
+    new_indices = torch.stack([new_row, new_col])
     
-    edge_index_prime, edge_attr_prime = dense_to_sparse_with_attr(W_prime_link)
+    # Coalesce to sum weights
+    from torch_geometric.utils import coalesce
+    # Ensure weights exist. If data has edge_attr, use it? 
+    # For OGB datasets without weights (weight=1), edge_attr is None.
     
+    if data.edge_attr is not None and data.edge_attr.size(0) == row.size(0):
+        # Assuming scalar weights or handling accumulation
+        weights = data.edge_attr
+        if weights.dim() > 1 and weights.size(1) > 1:
+             # Link prediction edge features? Summing them might not be right but for coarsening usually yes.
+             pass
+    else:
+        weights = torch.ones(row.size(0), device=device)
+
+    # Note: coalesce signature changes across PyG versions. 
+    # Trying reduce='add'.
+    edge_index_prime, edge_attr_prime = coalesce(new_indices, weights, num_nodes=total_new_nodes, reduce='add')
+        
     data_link = Data(x=X_prime, edge_index=edge_index_prime, edge_attr=edge_attr_prime)
     
     return data_link

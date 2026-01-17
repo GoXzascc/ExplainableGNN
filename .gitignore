@@ -214,3 +214,6 @@ logs/
 
 # cursor
 .cursorrules
+
+# pdf
+*.pdf
